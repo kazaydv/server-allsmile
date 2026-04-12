@@ -170,7 +170,6 @@ app.post('/send-otp', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({
         token: SPARROW_TOKEN,
-        from:  SPARROW_SENDER,
         to:    sparrowPhone,
         text:  message
       })
