@@ -15,8 +15,8 @@ app.use(cors());
 app.use(express.json());
 
 // ── CONFIG — Replace these ────────────────────
-const SPARROW_TOKEN  = 'YOUR_SPARROW_TOKEN';   // From web.sparrowsms.com
-const SPARROW_SENDER = 'YourSenderID';          // Your approved Sender ID
+const SPARROW_TOKEN  = 'v2_lBxZUNaLnXKKBH4B7Hz1Qv9cOY9.copp';   // From web.sparrowsms.com
+const SPARROW_SENDER = 'Allsmile';          // Your approved Sender ID
 const SPARROW_API    = 'https://api.sparrowsms.com/v2/sms/';
 const OTP_EXPIRY_MS  = 5 * 60 * 1000;          // 5 minutes
 const MAX_ATTEMPTS   = 5;
