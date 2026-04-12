@@ -15,16 +15,13 @@ const express = require('express');
 const cors    = require('cors');
 const app     = express();
 
-// ── node-fetch fallback (works on Node 16 and below too) ─
-let fetcher;
-(async () => {
+// ── node-fetch fallback (works on Node 16 and Node 18+) ──
+const fetcher = (...args) => {
   if (typeof fetch !== 'undefined') {
-    fetcher = fetch;                         // Node 18+ built-in
-  } else {
-    const mod = await import('node-fetch');  // Node 16 fallback
-    fetcher = mod.default;
+    return fetch(...args);               // Node 18+ built-in
   }
-})();
+  return require('node-fetch')(...args); // Node 16 fallback
+};
 
 app.use(cors({
   origin: '*',
@@ -35,32 +32,26 @@ app.options('*', cors());
 app.use(express.json());
 
 // ── CONFIG ────────────────────────────────────
-// Set SPARROW_TOKEN and SPARROW_SENDER as Environment Variables on Render.
-// Never hardcode secrets in source code.
 const SPARROW_TOKEN  = process.env.SPARROW_TOKEN  || '';
 const SPARROW_SENDER = process.env.SPARROW_SENDER || 'Allsmile';
 const SPARROW_API    = 'https://api.sparrowsms.com/v2/sms/';
-const OTP_EXPIRY_MS  = 5 * 60 * 1000;   // 5 minutes
+const OTP_EXPIRY_MS  = 5 * 60 * 1000;
 const MAX_ATTEMPTS   = 5;
-const PORT           = process.env.PORT || 3000;  // Render injects PORT automatically
+const PORT           = process.env.PORT || 3000;
 
-// Rate limiting: max OTP sends per phone per window
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX       = 3;         // max 3 sends per minute per number
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX       = 3;
 // ─────────────────────────────────────────────
 
-// Validate config on startup
 if (!SPARROW_TOKEN) {
   console.error('❌  SPARROW_TOKEN environment variable is not set. SMS will not work.');
 }
 
 // ── In-memory stores ──────────────────────────
-// OTP store:       { "98XXXXXXXX": { otp, expiry, attempts } }
-// Rate limit store: { "98XXXXXXXX": { count, windowStart } }
 const otpStore       = {};
 const rateLimitStore = {};
 
-// ── Cleanup: remove expired OTPs every 10 minutes ──
+// ── Cleanup expired OTPs every 10 minutes ─────
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
@@ -88,6 +79,13 @@ function isValidPhone(phone) {
   return /^[0-9]{10}$/.test(phone);
 }
 
+// ── Helper: Format phone for Sparrow ─────────
+// Sparrow requires 977XXXXXXXXXX format
+function formatPhone(phone) {
+  const digits = phone.replace(/^0/, ''); // strip leading 0 if present
+  return '977' + digits;
+}
+
 // ── Helper: Rate limit check ──────────────────
 function isRateLimited(phone) {
   const now    = Date.now();
@@ -107,19 +105,19 @@ function isRateLimited(phone) {
 }
 
 // ─────────────────────────────────────────────
-// ROUTE: GET /health  (wakes up Render cold-start)
+// ROUTE: GET /health
 // ─────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
 // ─────────────────────────────────────────────
-// ROUTE: GET /  (root info)
+// ROUTE: GET /
 // ─────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status:  '✅ OTP Server is running',
-    time:    new Date().toISOString(),
+    status:   '✅ OTP Server is running',
+    time:     new Date().toISOString(),
     smsReady: !!SPARROW_TOKEN
   });
 });
@@ -152,7 +150,9 @@ app.post('/send-otp', async (req, res) => {
     });
   }
 
-  const otp = generateOtp();
+  const otp          = generateOtp();
+  const sparrowPhone = formatPhone(phone); // e.g. 9812345678 → 9779812345678
+
   otpStore[phone] = {
     otp,
     expiry:   Date.now() + OTP_EXPIRY_MS,
@@ -161,19 +161,26 @@ app.post('/send-otp', async (req, res) => {
 
   const message = `Your Allsmile verification code is ${otp}. Valid for 5 minutes. Do not share this code.`;
 
-  const params = new URLSearchParams({
-    token: SPARROW_TOKEN,
-    from:  SPARROW_SENDER,
-    to:    phone,
-    text:  message
-  });
+  console.log(`📤 Sending OTP to ${sparrowPhone} via Sparrow...`);
 
   try {
-    const response = await fetcher(`${SPARROW_API}?${params.toString()}`);
-    const data     = await response.json();
+    // ✅ POST with JSON body — correct method for Sparrow v2
+    const response = await fetcher(SPARROW_API, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        token: SPARROW_TOKEN,
+        from:  SPARROW_SENDER,
+        to:    sparrowPhone,
+        text:  message
+      })
+    });
+
+    const data = await response.json();
+    console.log('📨 Sparrow full response:', JSON.stringify(data));
 
     if (data.response_code === 200) {
-      console.log(`✅ OTP sent → ${phone}`);
+      console.log(`✅ OTP sent → ${sparrowPhone}`);
       return res.json({ success: true, message: 'OTP sent successfully.' });
     } else {
       console.error(`❌ Sparrow error [${data.response_code}]:`, data.response);
