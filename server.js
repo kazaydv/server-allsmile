@@ -8,7 +8,7 @@ const app     = express();
 
 // ── node-fetch v2 (CommonJS compatible) ──────
 // Make sure you run: npm install node-fetch@2
-const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+const fetch = require('node-fetch');
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
