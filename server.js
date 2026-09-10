@@ -234,10 +234,9 @@ app.listen(PORT, () => {
   console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
 });
 
-// TEMPORARY — delete this route after copying the token once
 app.get('/get-admin-token', async (req, res) => {
   try {
-    const response = await fetch('https://allsmilenp.myshopify.com/admin/oauth/access_token', {
+    const response = await fetch('https://84d453-3.myshopify.com/admin/oauth/access_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -246,8 +245,13 @@ app.get('/get-admin-token', async (req, res) => {
         grant_type: 'client_credentials'
       })
     });
-    const data = await response.json();
-    res.json(data);
+
+    const text = await response.text();
+    res.json({
+      status: response.status,
+      statusText: response.statusText,
+      body: text.slice(0, 500)
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
