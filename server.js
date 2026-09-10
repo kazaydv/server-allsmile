@@ -234,25 +234,93 @@ app.listen(PORT, () => {
   console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
 });
 
-app.get('/get-admin-token', async (req, res) => {
+const crypto = require('crypto');
+
+const SHOP_DOMAIN = '84d453-3.myshopify.com';
+
+// Always fetches a brand-new token — avoids dealing with 24hr expiry manually
+async function getFreshAdminToken() {
+  const response = await fetch(`https://${SHOP_DOMAIN}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_CLIENT_ID,
+      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    })
+  });
+  const data = await response.json();
+  return data.access_token;
+}
+
+// ── ONE-TIME SETUP ROUTE — registers the webhook, then delete it ──
+app.get('/setup-webhook', async (req, res) => {
   try {
-    const response = await fetch('https://84d453-3.myshopify.com/admin/oauth/access_token', {
+    const token = await getFreshAdminToken();
+    const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/webhooks.json`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'X-Shopify-Access-Token': token,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({
-        client_id: process.env.SHOPIFY_CLIENT_ID,
-        client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-        grant_type: 'client_credentials'
+        webhook: {
+          topic: 'orders/create',
+          address: 'https://server-allsmile.onrender.com/webhooks/orders-create',
+          format: 'json'
+        }
       })
     });
-
-    const text = await response.text();
-    res.json({
-      status: response.status,
-      statusText: response.statusText,
-      body: text.slice(0, 500)
-    });
+    const data = await response.json();
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── THE ACTUAL FRAUD-CHECK HANDLER — this runs forever, keep it ──
+app.post('/webhooks/orders-create',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+    const digest = crypto
+      .createHmac('sha256', process.env.SHOPIFY_CLIENT_SECRET)
+      .update(req.body)
+      .digest('base64');
+
+    if (digest !== hmacHeader) {
+      return res.status(401).send('Invalid signature');
+    }
+
+    res.status(200).send('OK'); // acknowledge fast, Shopify expects this
+
+    const order = JSON.parse(req.body);
+    const noteAttrs = order.note_attributes || [];
+    const verifiedEntry = noteAttrs.find(a => a.name === 'verified_phone');
+    const verifiedPhone = verifiedEntry ? verifiedEntry.value : null;
+    const orderPhone = order.phone || (order.shipping_address && order.shipping_address.phone) || null;
+    const normalize = (p) => (p || '').replace(/\D/g, '').slice(-10);
+
+    const mismatch = verifiedPhone && orderPhone && normalize(verifiedPhone) !== normalize(orderPhone);
+    const missingVerification = !verifiedPhone;
+
+    if (mismatch || missingVerification) {
+      const tag = mismatch ? 'phone-mismatch' : 'no-otp-verification';
+      const token = await getFreshAdminToken();
+      await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/orders/${order.id}.json`, {
+        method: 'PUT',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          order: {
+            id: order.id,
+            tags: (order.tags ? order.tags + ', ' : '') + tag
+          }
+        })
+      });
+      console.log(`Flagged order ${order.name}: ${tag}`);
+    }
+  }
+);
