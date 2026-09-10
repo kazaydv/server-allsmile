@@ -233,3 +233,22 @@ app.listen(PORT, () => {
   console.log(`   Sender ID     : ${SPARROW_SENDER || 'NOT SET'}`);
   console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
 });
+
+// TEMPORARY — delete this route after copying the token once
+app.get('/get-admin-token', async (req, res) => {
+  try {
+    const response = await fetch('https://allsmilenp.myshopify.com/admin/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.SHOPIFY_CLIENT_ID,
+        client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+        grant_type: 'client_credentials'
+      })
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
