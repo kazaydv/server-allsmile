@@ -253,30 +253,7 @@ async function getFreshAdminToken() {
   return data.access_token;
 }
 
-// ── ONE-TIME SETUP ROUTE — registers the webhook, then delete it ──
-app.get('/setup-webhook', async (req, res) => {
-  try {
-    const token = await getFreshAdminToken();
-    const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/webhooks.json`, {
-      method: 'POST',
-      headers: {
-        'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        webhook: {
-          topic: 'orders/create',
-          address: 'https://server-allsmile.onrender.com/webhooks/orders-create',
-          format: 'json'
-        }
-      })
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+
 
 // ── THE ACTUAL FRAUD-CHECK HANDLER — this runs forever, keep it ──
 app.post('/webhooks/orders-create',
