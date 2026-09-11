@@ -7,14 +7,25 @@
 //   node server.js
 //
 // Render Environment Variables to set:
-//   SPARROW_TOKEN  → your token from web.sparrowsms.com
-//   SPARROW_SENDER → your approved Sender ID
+//   SPARROW_TOKEN         → your token from web.sparrowsms.com
+//   SPARROW_SENDER        → your approved Sender ID
+//   SHOPIFY_CLIENT_ID     → custom app / API client ID (for the orders-create webhook's admin token refresh)
+//   SHOPIFY_CLIENT_SECRET → custom app / API client secret (also verifies the webhook's HMAC signature)
 // =============================================
 
-const express    = require('express');
-const cors       = require('cors');
-const fetch      = require('node-fetch');
-const app        = express();
+const express = require('express');
+const cors    = require('cors');
+const fetch   = require('node-fetch');
+const crypto  = require('crypto');
+const app     = express();
+
+// Render sits in front of this app behind exactly one reverse-proxy hop.
+// This tells Express to trust that one hop's X-Forwarded-For header when
+// resolving req.ip — without it, req.ip would just be Render's internal
+// proxy address, not the visitor's real IP. Setting this to `1` (rather
+// than `true`) means only the outermost hop is trusted, so a client can't
+// spoof their IP by sending their own fake X-Forwarded-For header.
+app.set('trust proxy', 1);
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
@@ -29,10 +40,13 @@ const MAX_ATTEMPTS   = 5;
 const PORT           = process.env.PORT || 3000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX       = 3;
+const SHOP_DOMAIN    = '84d453-3.myshopify.com';
 // ─────────────────────────────────────────────
 
 if (!SPARROW_TOKEN)  console.error('❌  SPARROW_TOKEN is not set.');
 if (!SPARROW_SENDER) console.error('❌  SPARROW_SENDER is not set.');
+if (!process.env.SHOPIFY_CLIENT_ID)     console.error('❌  SHOPIFY_CLIENT_ID is not set.');
+if (!process.env.SHOPIFY_CLIENT_SECRET) console.error('❌  SHOPIFY_CLIENT_SECRET is not set.');
 
 // ── In-memory stores ──────────────────────────
 const otpStore       = {};
@@ -77,6 +91,22 @@ function isRateLimited(phone) {
   if (record.count >= RATE_LIMIT_MAX) return true;
   record.count++;
   return false;
+}
+
+// Resolves an IP to city/region/country via a free, keyless lookup API.
+// Never throws — on any failure it just returns blank fields, so a geo
+// hiccup can't block OTP verification itself.
+async function lookupGeo(ip) {
+  try {
+    const r = await fetch(`https://ipwho.is/${ip}`);
+    const d = await r.json();
+    if (d && d.success !== false) {
+      return { city: d.city || '', region: d.region || '', country: d.country || '' };
+    }
+  } catch (e) {
+    console.error('❌ Geo lookup failed:', e.message);
+  }
+  return { city: '', region: '', country: '' };
 }
 
 // ── Sparrow API call ──────────────────────────
@@ -194,7 +224,7 @@ app.post('/send-otp', async (req, res) => {
 // ROUTE: POST /verify-otp
 // Body: { phone: "98XXXXXXXX", otp: "123456" }
 // ─────────────────────────────────────────────
-app.post('/verify-otp', (req, res) => {
+app.post('/verify-otp', async (req, res) => {
   const { phone, otp } = req.body;
 
   if (!phone || !otp) {
@@ -222,7 +252,17 @@ app.post('/verify-otp', (req, res) => {
 
   delete otpStore[phone];
   console.log(`✅ OTP verified → ${phone}`);
-  return res.json({ verified: true });
+
+  const clientIp = req.ip; // real visitor IP now that trust proxy is set correctly
+  const geo      = await lookupGeo(clientIp);
+
+  return res.json({
+    verified: true,
+    ip:       clientIp,
+    city:     geo.city,
+    region:   geo.region,
+    country:  geo.country
+  });
 });
 
 // ── Start Server ──────────────────────────────
@@ -233,10 +273,6 @@ app.listen(PORT, () => {
   console.log(`   Sender ID     : ${SPARROW_SENDER || 'NOT SET'}`);
   console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
 });
-
-const crypto = require('crypto');
-
-const SHOP_DOMAIN = '84d453-3.myshopify.com';
 
 // Always fetches a brand-new token — avoids dealing with 24hr expiry manually
 async function getFreshAdminToken() {
@@ -252,8 +288,6 @@ async function getFreshAdminToken() {
   const data = await response.json();
   return data.access_token;
 }
-
-
 
 // ── THE ACTUAL FRAUD-CHECK HANDLER — this runs forever, keep it ──
 app.post('/webhooks/orders-create',
