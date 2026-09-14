@@ -9,8 +9,7 @@
 // Render Environment Variables to set:
 //   SPARROW_TOKEN         → your token from web.sparrowsms.com
 //   SPARROW_SENDER        → your approved Sender ID
-//   SHOPIFY_CLIENT_ID     → custom app / API client ID (for the webhook handlers' admin token refresh)
-//   SHOPIFY_CLIENT_SECRET → custom app / API client secret (also verifies both webhooks' HMAC signature)
+//   SHOPIFY_CLIENT_SECRET → custom app / API client secret (verifies the webhook's HMAC signature)
 //   META_PIXEL_ID         → Allsmile's Meta Pixel ID
 //   META_ACCESS_TOKEN     → Conversions API access token (Events Manager → Settings → Conversions API)
 //   CONFIRM_TAG           → optional, defaults to "confirmed"
@@ -36,8 +35,8 @@ app.options('*', cors());
 // Applied globally, with a verify callback that stashes the raw bytes on
 // req.rawBody before Express parses them. This means req.body is a normal
 // parsed object everywhere (no more per-route express.json() needed on
-// /send-otp or /verify-otp), while the two webhook routes below still get
-// the exact raw bytes they need for HMAC verification via req.rawBody —
+// /send-otp or /verify-otp), while the webhook route below still gets
+// the exact raw bytes it needs for HMAC verification via req.rawBody —
 // one parser, no ordering conflicts between routes.
 app.use(
   express.json({
@@ -66,13 +65,11 @@ const MAX_ATTEMPTS   = 5;
 const PORT           = process.env.PORT || 3000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX       = 3;
-const SHOP_DOMAIN    = '84d453-3.myshopify.com';
 const CONFIRM_TAG    = (process.env.CONFIRM_TAG || 'confirmed').toLowerCase();
 // ─────────────────────────────────────────────
 
 if (!SPARROW_TOKEN)  console.error('❌  SPARROW_TOKEN is not set.');
 if (!SPARROW_SENDER) console.error('❌  SPARROW_SENDER is not set.');
-if (!process.env.SHOPIFY_CLIENT_ID)     console.error('❌  SHOPIFY_CLIENT_ID is not set.');
 if (!process.env.SHOPIFY_CLIENT_SECRET) console.error('❌  SHOPIFY_CLIENT_SECRET is not set.');
 if (!process.env.META_PIXEL_ID)         console.error('❌  META_PIXEL_ID is not set.');
 if (!process.env.META_ACCESS_TOKEN)     console.error('❌  META_ACCESS_TOKEN is not set.');
@@ -140,21 +137,6 @@ async function lookupGeo(ip) {
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
-}
-
-// Always fetches a brand-new token — avoids dealing with 24hr expiry manually
-async function getFreshAdminToken() {
-  const response = await fetch(`https://${SHOP_DOMAIN}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: process.env.SHOPIFY_CLIENT_ID,
-      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-      grant_type: 'client_credentials'
-    })
-  });
-  const data = await response.json();
-  return data.access_token;
 }
 
 // ── Sparrow API call ──────────────────────────
@@ -349,21 +331,19 @@ app.post('/webhooks/orders-updated', async (req, res) => {
 
     try {
       const order = req.body; // already parsed by the global express.json() above
-      // Keep original casing for existingTags so the write-back below
-      // doesn't silently lowercase any of the order's other tags —
-      // existingTagsLower is a separate copy used only for matching.
       const existingTags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean);
       const existingTagsLower = existingTags.map(t => t.toLowerCase());
 
       const isConfirmed = existingTagsLower.includes(CONFIRM_TAG);
-      const alreadySent = existingTagsLower.includes('meta-purchase-sent');
 
-      console.log(`📥 orders-updated received → order ${order.id}, tags: [${existingTags.join(', ')}], looking for tag: "${CONFIRM_TAG}", isConfirmed: ${isConfirmed}, alreadySent: ${alreadySent}`);
+      console.log(`📥 orders-updated received → order ${order.id}, tags: [${existingTags.join(', ')}], looking for tag: "${CONFIRM_TAG}", isConfirmed: ${isConfirmed}`);
 
-      // Nothing to do unless the confirm tag is present and we haven't
-      // already reported this order — orders/updated fires on EVERY edit,
-      // so this guard is what stops duplicate Purchase events.
-      if (!isConfirmed || alreadySent) return;
+      // Nothing to do unless the confirm tag is present. If orders/updated
+      // fires again later for the same order (a re-edit, a fulfillment
+      // update, etc.), Meta's own event_id-based deduplication below is
+      // what stops it being double-counted — no local "already sent"
+      // tracking needed on this end.
+      if (!isConfirmed) return;
 
       const email = order.email || order.customer?.email || '';
       const phone = order.phone || order.customer?.phone || order.shipping_address?.phone || '';
@@ -372,7 +352,7 @@ app.post('/webhooks/orders-updated', async (req, res) => {
         data: [{
           event_name: 'ConfirmedPurchase',
           event_time: Math.floor(Date.now() / 1000),
-          event_id: `order_${order.id}`, // lets Meta dedupe if a browser pixel ever also fires this order
+          event_id: `order_${order.id}`, // Meta dedupes on this if the same order ever triggers this route again
           action_source: 'website',
           event_source_url: 'https://allsmilenp.com/',
           user_data: {
@@ -408,19 +388,7 @@ app.post('/webhooks/orders-updated', async (req, res) => {
       }
 
       console.log(`✅ ConfirmedPurchase sent to Meta → order ${order.id}, events_received: ${capiData.events_received}`);
-
-      // Tag the order so future edits never resend it
-      const token = await getFreshAdminToken();
-      const newTags = [...existingTags, 'meta-purchase-sent'].join(', ');
-
-      await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/orders/${order.id}.json`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Shopify-Access-Token': token
-        },
-        body: JSON.stringify({ order: { id: order.id, tags: newTags } })
-      });
+      // No tag write-back needed — Meta already dedupes repeat sends by event_id above.
 
     } catch (err) {
       console.error(`❌ Error processing confirmed-order webhook:`, err.message);
