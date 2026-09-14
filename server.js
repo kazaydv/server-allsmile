@@ -33,12 +33,19 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
 
-// NOTE: express.json() is intentionally NOT applied globally here.
-// Both webhook routes below need the raw, unparsed request body to verify
-// Shopify's HMAC signature — a global JSON parser would consume that body
-// first and leave nothing for express.raw() to read. Instead, express.json()
-// is applied only on the two routes below that actually need req.body as
-// an object: /send-otp and /verify-otp.
+// Applied globally, with a verify callback that stashes the raw bytes on
+// req.rawBody before Express parses them. This means req.body is a normal
+// parsed object everywhere (no more per-route express.json() needed on
+// /send-otp or /verify-otp), while the two webhook routes below still get
+// the exact raw bytes they need for HMAC verification via req.rawBody —
+// one parser, no ordering conflicts between routes.
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    }
+  })
+);
 
 // A crash in one webhook delivery shouldn't take down the whole OTP server —
 // customers mid-checkout depend on /verify-otp staying up. Log and continue
@@ -227,9 +234,8 @@ app.get('/test-sparrow', async (req, res) => {
 // ─────────────────────────────────────────────
 // ROUTE: POST /send-otp
 // Body: { phone: "98XXXXXXXX" }
-// express.json() applied here only — this route needs req.body as an object.
 // ─────────────────────────────────────────────
-app.post('/send-otp', express.json(), async (req, res) => {
+app.post('/send-otp', async (req, res) => {
   const { phone } = req.body;
 
   if (!phone || !isValidPhone(phone)) {
@@ -267,9 +273,8 @@ app.post('/send-otp', express.json(), async (req, res) => {
 // ─────────────────────────────────────────────
 // ROUTE: POST /verify-otp
 // Body: { phone: "98XXXXXXXX", otp: "123456" }
-// express.json() applied here only — this route needs req.body as an object.
 // ─────────────────────────────────────────────
-app.post('/verify-otp', express.json(), async (req, res) => {
+app.post('/verify-otp', async (req, res) => {
   const { phone, otp } = req.body;
 
   if (!phone || !otp) {
@@ -321,23 +326,28 @@ app.post('/verify-otp', express.json(), async (req, res) => {
 // Ads Manager around this event name, and campaigns repointed to it,
 // before this will show up in reporting or feed campaign optimization.
 // ─────────────────────────────────────────────
-app.post('/webhooks/orders-updated',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
+app.post('/webhooks/orders-updated', async (req, res) => {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
     const digest = crypto
       .createHmac('sha256', process.env.SHOPIFY_CLIENT_SECRET)
-      .update(req.body)
+      .update(req.rawBody)
       .digest('base64');
 
-    if (digest !== hmacHeader) {
+    let validSignature = false;
+    try {
+      validSignature = hmacHeader && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+    } catch {
+      validSignature = false; // lengths differ — definitely not a match
+    }
+
+    if (!validSignature) {
       return res.status(401).send('Invalid signature');
     }
 
     res.status(200).send('OK'); // ack fast, same as orders-create
 
     try {
-      const order = JSON.parse(req.body);
+      const order = req.body; // already parsed by the global express.json() above
       // Keep original casing for existingTags so the write-back below
       // doesn't silently lowercase any of the order's other tags —
       // existingTagsLower is a separate copy used only for matching.
@@ -361,6 +371,7 @@ app.post('/webhooks/orders-updated',
           event_time: Math.floor(Date.now() / 1000),
           event_id: `order_${order.id}`, // lets Meta dedupe if a browser pixel ever also fires this order
           action_source: 'website',
+          event_source_url: 'https://allsmilenp.com/',
           user_data: {
             em: email ? [sha256(email)] : undefined,
             // NOTE: strips everything but digits. Confirm your checkout phone
