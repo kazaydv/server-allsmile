@@ -9,8 +9,11 @@
 // Render Environment Variables to set:
 //   SPARROW_TOKEN         → your token from web.sparrowsms.com
 //   SPARROW_SENDER        → your approved Sender ID
-//   SHOPIFY_CLIENT_ID     → custom app / API client ID (for the orders-create webhook's admin token refresh)
-//   SHOPIFY_CLIENT_SECRET → custom app / API client secret (also verifies the webhook's HMAC signature)
+//   SHOPIFY_CLIENT_ID     → custom app / API client ID (for the webhook handlers' admin token refresh)
+//   SHOPIFY_CLIENT_SECRET → custom app / API client secret (also verifies both webhooks' HMAC signature)
+//   META_PIXEL_ID         → Allsmile's Meta Pixel ID
+//   META_ACCESS_TOKEN     → Conversions API access token (Events Manager → Settings → Conversions API)
+//   CONFIRM_TAG           → optional, defaults to "confirmed"
 // =============================================
 
 const express = require('express');
@@ -29,7 +32,23 @@ app.set('trust proxy', 1);
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.options('*', cors());
-app.use(express.json());
+
+// NOTE: express.json() is intentionally NOT applied globally here.
+// Both webhook routes below need the raw, unparsed request body to verify
+// Shopify's HMAC signature — a global JSON parser would consume that body
+// first and leave nothing for express.raw() to read. Instead, express.json()
+// is applied only on the two routes below that actually need req.body as
+// an object: /send-otp and /verify-otp.
+
+// A crash in one webhook delivery shouldn't take down the whole OTP server —
+// customers mid-checkout depend on /verify-otp staying up. Log and continue
+// instead of letting Node terminate the process on an unhandled rejection.
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Unhandled rejection (server kept running):', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught exception (server kept running):', err);
+});
 
 // ── CONFIG ────────────────────────────────────
 const SPARROW_TOKEN  = process.env.SPARROW_TOKEN  || '';
@@ -41,12 +60,15 @@ const PORT           = process.env.PORT || 3000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX       = 3;
 const SHOP_DOMAIN    = '84d453-3.myshopify.com';
+const CONFIRM_TAG    = (process.env.CONFIRM_TAG || 'confirmed').toLowerCase();
 // ─────────────────────────────────────────────
 
 if (!SPARROW_TOKEN)  console.error('❌  SPARROW_TOKEN is not set.');
 if (!SPARROW_SENDER) console.error('❌  SPARROW_SENDER is not set.');
 if (!process.env.SHOPIFY_CLIENT_ID)     console.error('❌  SHOPIFY_CLIENT_ID is not set.');
 if (!process.env.SHOPIFY_CLIENT_SECRET) console.error('❌  SHOPIFY_CLIENT_SECRET is not set.');
+if (!process.env.META_PIXEL_ID)         console.error('❌  META_PIXEL_ID is not set.');
+if (!process.env.META_ACCESS_TOKEN)     console.error('❌  META_ACCESS_TOKEN is not set.');
 
 // ── In-memory stores ──────────────────────────
 const otpStore       = {};
@@ -109,6 +131,25 @@ async function lookupGeo(ip) {
   return { city: '', region: '', country: '' };
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
+}
+
+// Always fetches a brand-new token — avoids dealing with 24hr expiry manually
+async function getFreshAdminToken() {
+  const response = await fetch(`https://${SHOP_DOMAIN}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_CLIENT_ID,
+      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    })
+  });
+  const data = await response.json();
+  return data.access_token;
+}
+
 // ── Sparrow API call ──────────────────────────
 async function callSparrow(to, text) {
   const params = new URLSearchParams({
@@ -144,7 +185,9 @@ app.get('/', (req, res) => {
     senderSet:    !!SPARROW_SENDER,
     senderValue:  SPARROW_SENDER  || '(not set)',
     tokenPreview: SPARROW_TOKEN ? `${SPARROW_TOKEN.slice(0,6)}...${SPARROW_TOKEN.slice(-4)}` : '(not set)',
-    tokenLength:  SPARROW_TOKEN.length
+    tokenLength:  SPARROW_TOKEN.length,
+    metaPixelSet: !!process.env.META_PIXEL_ID,
+    metaTokenSet: !!process.env.META_ACCESS_TOKEN
   });
 });
 
@@ -184,8 +227,9 @@ app.get('/test-sparrow', async (req, res) => {
 // ─────────────────────────────────────────────
 // ROUTE: POST /send-otp
 // Body: { phone: "98XXXXXXXX" }
+// express.json() applied here only — this route needs req.body as an object.
 // ─────────────────────────────────────────────
-app.post('/send-otp', async (req, res) => {
+app.post('/send-otp', express.json(), async (req, res) => {
   const { phone } = req.body;
 
   if (!phone || !isValidPhone(phone)) {
@@ -223,8 +267,9 @@ app.post('/send-otp', async (req, res) => {
 // ─────────────────────────────────────────────
 // ROUTE: POST /verify-otp
 // Body: { phone: "98XXXXXXXX", otp: "123456" }
+// express.json() applied here only — this route needs req.body as an object.
 // ─────────────────────────────────────────────
-app.post('/verify-otp', async (req, res) => {
+app.post('/verify-otp', express.json(), async (req, res) => {
   const { phone, otp } = req.body;
 
   if (!phone || !otp) {
@@ -265,105 +310,13 @@ app.post('/verify-otp', async (req, res) => {
   });
 });
 
-// ── Start Server ──────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 OTP Server running → http://localhost:${PORT}`);
-  console.log(`   Token preview : ${SPARROW_TOKEN ? SPARROW_TOKEN.slice(0,6)+'...'+SPARROW_TOKEN.slice(-4) : 'NOT SET'}`);
-  console.log(`   Token length  : ${SPARROW_TOKEN.length}`);
-  console.log(`   Sender ID     : ${SPARROW_SENDER || 'NOT SET'}`);
-  console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
-});
-
-// Always fetches a brand-new token — avoids dealing with 24hr expiry manually
-async function getFreshAdminToken() {
-  const response = await fetch(`https://${SHOP_DOMAIN}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: process.env.SHOPIFY_CLIENT_ID,
-      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-      grant_type: 'client_credentials'
-    })
-  });
-  const data = await response.json();
-  return data.access_token;
-}
-
-// ── THE ACTUAL FRAUD-CHECK HANDLER — this runs forever, keep it ──
-app.post('/webhooks/orders-create',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    const digest = crypto
-      .createHmac('sha256', process.env.SHOPIFY_CLIENT_SECRET)
-      .update(req.body)
-      .digest('base64');
-
-    if (digest !== hmacHeader) {
-      return res.status(401).send('Invalid signature');
-    }
-
-    res.status(200).send('OK'); // acknowledge fast, Shopify expects this
-
-    const order = JSON.parse(req.body);
-    const noteAttrs = order.note_attributes || [];
-    const verifiedEntry = noteAttrs.find(a => a.name === 'verified_phone');
-    const verifiedPhone = verifiedEntry ? verifiedEntry.value : null;
-    const orderPhone = order.phone || (order.shipping_address && order.shipping_address.phone) || null;
-    const normalize = (p) => (p || '').replace(/\D/g, '').slice(-10);
-
-    const mismatch = verifiedPhone && orderPhone && normalize(verifiedPhone) !== normalize(orderPhone);
-    const missingVerification = !verifiedPhone;
-
-    if (mismatch || missingVerification) {
-      const tag = mismatch ? 'phone-mismatch' : 'no-otp-verification';
-      const token = await getFreshAdminToken();
-      await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/orders/${order.id}.json`, {
-        method: 'PUT',
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          order: {
-            id: order.id,
-            tags: (order.tags ? order.tags + ', ' : '') + tag
-          }
-        })
-      });
-      console.log(`Flagged order ${order.name}: ${tag}`);
-    }
-  }
-);
-// ============================================================
-// META CAPI — Confirmed Purchase Webhook
-// ============================================================
-// Paste this into your existing server.js, below the
-// /webhooks/orders-create route. It reuses SHOP_DOMAIN and
-// getFreshAdminToken() that are already defined there.
-//
-// New env vars to add in Render:
-//   META_PIXEL_ID    → your Allsmile Meta Pixel ID
-//   META_ACCESS_TOKEN → Events Manager → Settings →
-//                        Conversions API → Generate Access Token
-//   CONFIRM_TAG       → optional, defaults to "confirmed"
-//
-// Note: this route reuses your existing SHOPIFY_CLIENT_SECRET for HMAC
-// verification — same secret as your orders-create route, since both
-// are registered under the same "Fraud check webhook" custom app.
-//
-// New Shopify webhook subscription (same "Fraud check webhook"
-// custom app you already have):
-//   Topic: Order updated (orders/updated)
-//   URL:   https://server-allsmile.onrender.com/webhooks/orders-updated
-// ============================================================
-
-const CONFIRM_TAG = (process.env.CONFIRM_TAG || 'confirmed').toLowerCase();
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
-}
-
+// ─────────────────────────────────────────────
+// ROUTE: POST /webhooks/orders-updated
+// Fires a Meta Purchase event via Conversions API only once the sales team
+// has written CONFIRM_TAG (default "confirmed") into the order's internal
+// note — this is the gate that stops fake COD orders from ever reaching
+// Meta as a Purchase before a human has actually verified them.
+// ─────────────────────────────────────────────
 app.post('/webhooks/orders-updated',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
@@ -379,19 +332,19 @@ app.post('/webhooks/orders-updated',
 
     res.status(200).send('OK'); // ack fast, same as orders-create
 
-    const order = JSON.parse(req.body);
-    const note = (order.note || '').toLowerCase();
-    const existingTags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean);
-
-    const isConfirmed = note.includes(CONFIRM_TAG);
-    const alreadySent = existingTags.includes('meta-purchase-sent');
-
-    // Nothing to do unless the note is newly confirmed and we haven't
-    // already reported this order — orders/updated fires on EVERY edit,
-    // so this guard is what stops duplicate Purchase events.
-    if (!isConfirmed || alreadySent) return;
-
     try {
+      const order = JSON.parse(req.body);
+      const note = (order.note || '').toLowerCase();
+      const existingTags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+
+      const isConfirmed = note.includes(CONFIRM_TAG);
+      const alreadySent = existingTags.includes('meta-purchase-sent');
+
+      // Nothing to do unless the note is newly confirmed and we haven't
+      // already reported this order — orders/updated fires on EVERY edit,
+      // so this guard is what stops duplicate Purchase events.
+      if (!isConfirmed || alreadySent) return;
+
       const email = order.email || order.customer?.email || '';
       const phone = order.phone || order.customer?.phone || order.shipping_address?.phone || '';
 
@@ -439,9 +392,7 @@ app.post('/webhooks/orders-updated',
       const token = await getFreshAdminToken();
       const newTags = [...existingTags, 'meta-purchase-sent'].join(', ');
 
-      // NOTE: matches your existing tag-write pattern's API version —
-      // double check this against whatever version orders-create already uses.
-      await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-10/orders/${order.id}.json`, {
+      await fetch(`https://${SHOP_DOMAIN}/admin/api/2025-01/orders/${order.id}.json`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -451,7 +402,16 @@ app.post('/webhooks/orders-updated',
       });
 
     } catch (err) {
-      console.log(`❌ Error processing confirmed order ${order.id}:`, err.message);
+      console.error(`❌ Error processing confirmed-order webhook:`, err.message);
     }
   }
 );
+
+// ── Start Server ──────────────────────────────
+app.listen(PORT, () => {
+  console.log(`🚀 OTP Server running → http://localhost:${PORT}`);
+  console.log(`   Token preview : ${SPARROW_TOKEN ? SPARROW_TOKEN.slice(0,6)+'...'+SPARROW_TOKEN.slice(-4) : 'NOT SET'}`);
+  console.log(`   Token length  : ${SPARROW_TOKEN.length}`);
+  console.log(`   Sender ID     : ${SPARROW_SENDER || 'NOT SET'}`);
+  console.log(`   OTP Expiry    : ${OTP_EXPIRY_MS / 60000} minutes`);
+});
