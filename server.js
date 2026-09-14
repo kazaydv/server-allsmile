@@ -312,10 +312,14 @@ app.post('/verify-otp', express.json(), async (req, res) => {
 
 // ─────────────────────────────────────────────
 // ROUTE: POST /webhooks/orders-updated
-// Fires a Meta Purchase event via Conversions API only once the sales team
-// has written CONFIRM_TAG (default "confirmed") into the order's internal
-// note — this is the gate that stops fake COD orders from ever reaching
-// Meta as a Purchase before a human has actually verified them.
+// Fires a Meta ConfirmedPurchase event via Conversions API only once the
+// sales team has added the CONFIRM_TAG tag (default "confirmed") to the
+// order — this is the gate that stops fake COD orders from ever reaching
+// Meta before a human has actually verified them.
+// NOTE: this sends a CUSTOM event named "ConfirmedPurchase", not the
+// standard "Purchase" event — a Custom Conversion must be set up in Meta
+// Ads Manager around this event name, and campaigns repointed to it,
+// before this will show up in reporting or feed campaign optimization.
 // ─────────────────────────────────────────────
 app.post('/webhooks/orders-updated',
   express.raw({ type: 'application/json' }),
@@ -334,13 +338,16 @@ app.post('/webhooks/orders-updated',
 
     try {
       const order = JSON.parse(req.body);
-      const note = (order.note || '').toLowerCase();
+      // Keep original casing for existingTags so the write-back below
+      // doesn't silently lowercase any of the order's other tags —
+      // existingTagsLower is a separate copy used only for matching.
       const existingTags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+      const existingTagsLower = existingTags.map(t => t.toLowerCase());
 
-      const isConfirmed = note.includes(CONFIRM_TAG);
-      const alreadySent = existingTags.includes('meta-purchase-sent');
+      const isConfirmed = existingTagsLower.includes(CONFIRM_TAG);
+      const alreadySent = existingTagsLower.includes('meta-purchase-sent');
 
-      // Nothing to do unless the note is newly confirmed and we haven't
+      // Nothing to do unless the confirm tag is present and we haven't
       // already reported this order — orders/updated fires on EVERY edit,
       // so this guard is what stops duplicate Purchase events.
       if (!isConfirmed || alreadySent) return;
@@ -350,7 +357,7 @@ app.post('/webhooks/orders-updated',
 
       const eventPayload = {
         data: [{
-          event_name: 'Purchase',
+          event_name: 'ConfirmedPurchase',
           event_time: Math.floor(Date.now() / 1000),
           event_id: `order_${order.id}`, // lets Meta dedupe if a browser pixel ever also fires this order
           action_source: 'website',
@@ -388,7 +395,7 @@ app.post('/webhooks/orders-updated',
 
       console.log(`✅ Purchase sent to Meta → order ${order.id}, events_received: ${capiData.events_received}`);
 
-      // Tag the order so future note edits never resend it
+      // Tag the order so future edits never resend it
       const token = await getFreshAdminToken();
       const newTags = [...existingTags, 'meta-purchase-sent'].join(', ');
 
