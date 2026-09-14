@@ -335,3 +335,123 @@ app.post('/webhooks/orders-create',
     }
   }
 );
+// ============================================================
+// META CAPI — Confirmed Purchase Webhook
+// ============================================================
+// Paste this into your existing server.js, below the
+// /webhooks/orders-create route. It reuses SHOP_DOMAIN and
+// getFreshAdminToken() that are already defined there.
+//
+// New env vars to add in Render:
+//   META_PIXEL_ID    → your Allsmile Meta Pixel ID
+//   META_ACCESS_TOKEN → Events Manager → Settings →
+//                        Conversions API → Generate Access Token
+//   CONFIRM_TAG       → optional, defaults to "confirmed"
+//
+// Note: this route reuses your existing SHOPIFY_CLIENT_SECRET for HMAC
+// verification — same secret as your orders-create route, since both
+// are registered under the same "Fraud check webhook" custom app.
+//
+// New Shopify webhook subscription (same "Fraud check webhook"
+// custom app you already have):
+//   Topic: Order updated (orders/updated)
+//   URL:   https://server-allsmile.onrender.com/webhooks/orders-updated
+// ============================================================
+
+const CONFIRM_TAG = (process.env.CONFIRM_TAG || 'confirmed').toLowerCase();
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
+}
+
+app.post('/webhooks/orders-updated',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+    const digest = crypto
+      .createHmac('sha256', process.env.SHOPIFY_CLIENT_SECRET)
+      .update(req.body)
+      .digest('base64');
+
+    if (digest !== hmacHeader) {
+      return res.status(401).send('Invalid signature');
+    }
+
+    res.status(200).send('OK'); // ack fast, same as orders-create
+
+    const order = JSON.parse(req.body);
+    const note = (order.note || '').toLowerCase();
+    const existingTags = (order.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+
+    const isConfirmed = note.includes(CONFIRM_TAG);
+    const alreadySent = existingTags.includes('meta-purchase-sent');
+
+    // Nothing to do unless the note is newly confirmed and we haven't
+    // already reported this order — orders/updated fires on EVERY edit,
+    // so this guard is what stops duplicate Purchase events.
+    if (!isConfirmed || alreadySent) return;
+
+    try {
+      const email = order.email || order.customer?.email || '';
+      const phone = order.phone || order.customer?.phone || order.shipping_address?.phone || '';
+
+      const eventPayload = {
+        data: [{
+          event_name: 'Purchase',
+          event_time: Math.floor(Date.now() / 1000),
+          event_id: `order_${order.id}`, // lets Meta dedupe if a browser pixel ever also fires this order
+          action_source: 'website',
+          user_data: {
+            em: email ? [sha256(email)] : undefined,
+            // NOTE: strips everything but digits. Confirm your checkout phone
+            // format includes the country code (9779XXXXXXXXX), or match quality
+            // on this identifier drops — worth checking one real order's shape.
+            ph: phone ? [sha256(phone.replace(/[^\d]/g, ''))] : undefined,
+          },
+          custom_data: {
+            currency: order.currency,
+            value: parseFloat(order.total_price),
+            content_ids: (order.line_items || []).map(li => String(li.product_id)),
+            content_type: 'product',
+            num_items: (order.line_items || []).reduce((n, li) => n + li.quantity, 0),
+          }
+        }]
+      };
+
+      const capiRes = await fetch(
+        `https://graph.facebook.com/v19.0/${process.env.META_PIXEL_ID}/events?access_token=${process.env.META_ACCESS_TOKEN}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(eventPayload)
+        }
+      );
+      const capiData = await capiRes.json();
+
+      if (capiData.error) {
+        console.log(`❌ CAPI error on order ${order.id}:`, capiData.error.message);
+        return;
+      }
+
+      console.log(`✅ Purchase sent to Meta → order ${order.id}, events_received: ${capiData.events_received}`);
+
+      // Tag the order so future note edits never resend it
+      const token = await getFreshAdminToken();
+      const newTags = [...existingTags, 'meta-purchase-sent'].join(', ');
+
+      // NOTE: matches your existing tag-write pattern's API version —
+      // double check this against whatever version orders-create already uses.
+      await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-10/orders/${order.id}.json`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': token
+        },
+        body: JSON.stringify({ order: { id: order.id, tags: newTags } })
+      });
+
+    } catch (err) {
+      console.log(`❌ Error processing confirmed order ${order.id}:`, err.message);
+    }
+  }
+);
