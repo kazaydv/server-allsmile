@@ -341,6 +341,7 @@ app.post('/webhooks/orders-updated', async (req, res) => {
     }
 
     if (!validSignature) {
+      console.log('❌ orders-updated: signature check failed — request ignored.');
       return res.status(401).send('Invalid signature');
     }
 
@@ -356,6 +357,8 @@ app.post('/webhooks/orders-updated', async (req, res) => {
 
       const isConfirmed = existingTagsLower.includes(CONFIRM_TAG);
       const alreadySent = existingTagsLower.includes('meta-purchase-sent');
+
+      console.log(`📥 orders-updated received → order ${order.id}, tags: [${existingTags.join(', ')}], looking for tag: "${CONFIRM_TAG}", isConfirmed: ${isConfirmed}, alreadySent: ${alreadySent}`);
 
       // Nothing to do unless the confirm tag is present and we haven't
       // already reported this order — orders/updated fires on EVERY edit,
@@ -404,7 +407,7 @@ app.post('/webhooks/orders-updated', async (req, res) => {
         return;
       }
 
-      console.log(`✅ Purchase sent to Meta → order ${order.id}, events_received: ${capiData.events_received}`);
+      console.log(`✅ ConfirmedPurchase sent to Meta → order ${order.id}, events_received: ${capiData.events_received}`);
 
       // Tag the order so future edits never resend it
       const token = await getFreshAdminToken();
